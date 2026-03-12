@@ -28,11 +28,11 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 **What you CANNOT do:**
 - Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, flow matching, and training constants (time budget, image resolution, etc).
 - Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_fid` function in `prepare.py` is the ground truth metric. You also can not add more data. 
+- Modify the evaluation harness. The `evaluate_fid` function in `prepare.py` is the ground truth metric. You also can not add more data.
 
 **The goal is simple: get the lowest val_fid.** Since the time budget is fixed, you don't need to worry about training time — it's always 1 hour. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_fid gains, but it should not blow up dramatically. Zero order is much more memory efficient and you should keep that in mind. Its able to train 'in place' with no solver bloat. You should consider this as a plus and keep it if possible. Caching of the probe speeds things up which you can do if you must. 
+**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_fid gains, but it should not blow up dramatically. Zero order is much more memory efficient and you should keep that in mind. Its able to train 'in place' with no solver bloat. You should consider this as a plus and keep it if possible. Caching of the probe speeds things up which you can do if you must.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_fid improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_fid improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
 
@@ -118,4 +118,82 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~1 hour then you can run approx 1/hour * # of GPUs available (which is 8 A100s on this node), for a total of about 64 over the duration of the average human sleep (8 hours). The user then wakes up to experimental results, all completed by you while they slept! You should NEVER STOP THOUGH! Keep making the solver, the architecture, and the diffusion better and better. 
+As an example use case, a user might leave you running while they sleep. If each experiment takes you ~1 hour then you can run approx 1/hour * # of GPUs available (which is 8 A100s on this node), for a total of about 64 over the duration of the average human sleep (8 hours). The user then wakes up to experimental results, all completed by you while they slept! You should NEVER STOP THOUGH! Keep making the solver, the architecture, and the diffusion better and better.
+
+## Batch loader experiment scope
+
+**For this run**, the experimental surface is narrowed to **batch construction only**. The backbone, loss, diffusion process, SPSA math, and evaluation are frozen. The only thing that changes is which images are fed into the solver at each step.
+
+### Frozen after calibration (do not change)
+
+- Architecture (depth, width, channels, patch size)
+- Denoising steps, loss definition
+- SPSA solver math, number of perturbations, epsilon/LR schedule
+
+### Available batch policies
+
+All policies are selectable via `--batch-policy` CLI flag:
+
+```
+--batch-policy iid_raw                                                # baseline (default)
+--batch-policy iid_replay   --replay-factor {2,4,8}                   # replay same batch r times
+--batch-policy random_bucket_mean   --compression {2,4,8,16}          # average random buckets
+--batch-policy random_bucket_medoid --compression {2,4,8,16}          # medoid of random buckets
+--batch-policy random_bucket_mix    --compression {2,4,8} --bucket-alpha {0.25,0.5,0.75}
+--batch-policy local_similarity_bucket --compression {2,4,8} --oversample {1,2} --bucket-repr {mean,medoid,mix}
+--batch-policy ema_slot_bank --ema-beta {0.9,0.99,0.995} --ema-emit {ema_only,current_mix}
+--batch-policy prototype_bank_ema --bank-size-mult {4,8,16} --proto-beta {0.95,0.99}
+```
+
+Any policy can be combined with `--replay-factor {2,4}` for hybrid replay.
+Use `--debug-minutes N` for quick smoke tests before committing to full 1-hour runs.
+
+### Experimental ladder
+
+- **Phase 0**: Baseline + replay (iid_raw, iid_replay r=2, r=4)
+- **Phase 1**: Random bucket compression (mean, medoid, mix at various m)
+- **Phase 2**: Similarity-aware compression (local_similarity_bucket variants)
+- **Phase 3**: Online rolling-average (ema_slot_bank variants)
+- **Phase 4**: Larger compressed memory (prototype_bank_ema variants)
+- **Phase 5**: Combine the best policy with replay
+
+## Fixed training configuration (MANDATORY for all runs)
+
+Every single run MUST use these exact settings. No exceptions.
+
+```
+--solver spsa
+--depth 1
+--denoising-steps 5
+--use-curvature
+--saturating-alpha 0.1
+--lr 1e-4
+--n-perts 40
+--device-batch-size 64
+```
+
+LR can be tuned slightly (e.g. 5e-5 to 3e-4) if needed for a specific batch policy, but must be justified and logged. Everything else is locked.
+
+## What you CANNOT do (batch loader experiment)
+
+These are **hard constraints** that override the general "everything is fair game" guidance above. For this experiment:
+
+- **DO NOT** change the model architecture (depth, width, channels, patch size, attention heads). It stays at depth=1, n_embd=768, patch_size=4.
+- **DO NOT** change the diffusion schedule. Denoising steps = 5, constant, for all runs.
+- **DO NOT** change the loss function. MSE denoising loss only.
+- **DO NOT** change the SPSA solver math, number of perturbations (40), or saturating alpha (0.1).
+- **DO NOT** add Adam, momentum, or any other optimizer. Pure 1.5-SPSA only.
+- **DO NOT** add backprop baselines or gradient-based training of any kind.
+- **DO NOT** use class labels or class-aware grouping in batch construction.
+- **DO NOT** change the evaluation harness, prepare.py, or install new packages.
+- **DO NOT** change warmup/warmdown schedule ratios.
+
+## What you SHOULD do (batch loader experiment)
+
+- **DO** experiment with different `--batch-policy` settings and their hyperparameters.
+- **DO** try different compression factors, replay factors, EMA betas, bank sizes, etc.
+- **DO** combine policies with replay (`--replay-factor`).
+- **DO** log batch policy diagnostics (raw images seen, virtual images seen, CPU time, compression ratio).
+- **DO** use `--debug-minutes 5` for quick smoke tests before full 1-hour runs.
+- **DO** follow the experimental ladder systematically (Phase 0 through Phase 5).
+- **DO** keep the code simple — batch policy logic should be clean and readable.
